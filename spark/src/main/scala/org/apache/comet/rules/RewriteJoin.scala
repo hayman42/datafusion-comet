@@ -21,24 +21,57 @@ package org.apache.comet.rules
 
 import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight, BuildSide, JoinSelectionHelper}
 import org.apache.spark.sql.catalyst.plans.{JoinType, LeftSemi}
+import org.apache.spark.sql.catalyst.plans.logical.Join
+import org.apache.spark.sql.comet._
 import org.apache.spark.sql.execution.{SortExec, SparkPlan}
+import org.apache.spark.sql.execution.adaptive.{AQEShuffleReadExec, ShuffleQueryStageExec}
 import org.apache.spark.sql.execution.joins.{ShuffledHashJoinExec, SortMergeJoinExec}
 
 /**
  * Adapted from equivalent rule in Apache Gluten.
  *
  * This rule replaces [[SortMergeJoinExec]] with [[ShuffledHashJoinExec]].
+ * If AQE is enabled, select the optimal build side for [[CometHashJoinExec]] based on runtime statistics.
  */
 object RewriteJoin extends JoinSelectionHelper {
 
-  private def getBuildSide(joinType: JoinType): Option[BuildSide] = {
-    if (canBuildShuffledHashJoinRight(joinType)) {
-      Some(BuildRight)
-    } else if (canBuildShuffledHashJoinLeft(joinType)) {
-      Some(BuildLeft)
-    } else {
-      None
+  private def getOptimalBuildSide(left: SparkPlan, right: SparkPlan): Option[BuildSide] = {
+    // Select build side based on runtime statistics
+    val leftSize = left match {
+      case plan @ AQEShuffleReadExec(stage: ShuffleQueryStageExec, _) =>
+        stage.mapStats.get.bytesByPartitionId.sum
+      case _ => return None
     }
+    val rightSize = right match {
+      case plan @ AQEShuffleReadExec(stage: ShuffleQueryStageExec, _) =>
+        stage.mapStats.get.bytesByPartitionId.sum
+      case _ => return None
+    }
+    if (rightSize <= leftSize) {
+      return Some(BuildRight)
+    }
+    Some(BuildLeft)
+  }
+
+  private def getBuildSide(join: SortMergeJoinExec): Option[BuildSide] = {
+    // Select build side based on join type and logical plan statistics
+    val leftBuildable = canBuildShuffledHashJoinLeft(join.joinType)
+    val rightBuildable = canBuildShuffledHashJoinRight(join.joinType)
+    val leftSize = join.left.logicalLink match {
+      case Some(plan) => plan.stats.sizeInBytes
+      case _ => return Some(BuildRight)
+    }
+    val rightSize = join.right.logicalLink match {
+      case Some(plan) => plan.stats.sizeInBytes
+      case _ => return Some(BuildRight)
+    }
+    if (!leftBuildable && !rightBuildable) {
+      return None
+    }
+    if (!leftBuildable || rightSize < leftSize) {
+      return Some(BuildRight)
+    }
+    Some(BuildLeft)
   }
 
   private def removeSort(plan: SparkPlan) = plan match {
@@ -47,8 +80,13 @@ object RewriteJoin extends JoinSelectionHelper {
   }
 
   def rewrite(plan: SparkPlan): SparkPlan = plan match {
+    case shj: CometHashJoinExec =>
+      getOptimalBuildSide(shj.left, shj.right) match {
+        case Some(buildSide) => shj.copy(buildSide = buildSide)
+        case _ => plan
+      }
     case smj: SortMergeJoinExec =>
-      getBuildSide(smj.joinType) match {
+      getBuildSide(smj) match {
         case Some(BuildRight) if smj.joinType == LeftSemi =>
           // TODO this was added as a workaround for TPC-DS q14 hanging and needs
           // further investigation
