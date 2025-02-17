@@ -31,20 +31,20 @@ import org.apache.spark.sql.execution.joins.{ShuffledHashJoinExec, SortMergeJoin
  * Adapted from equivalent rule in Apache Gluten.
  *
  * This rule replaces [[SortMergeJoinExec]] with [[ShuffledHashJoinExec]].
- * If AQE is enabled, select the optimal build side for [[CometHashJoinExec]] based on runtime statistics.
+ * If AQE is enabled, select the optimal build side for [[CometHashJoinExec]].
  */
 object RewriteJoin extends JoinSelectionHelper {
 
   private def getOptimalBuildSide(left: SparkPlan, right: SparkPlan): Option[BuildSide] = {
     // Select build side based on runtime statistics
     val leftSize = left match {
-      case plan @ AQEShuffleReadExec(stage: ShuffleQueryStageExec, _) =>
-        stage.mapStats.get.bytesByPartitionId.sum
+      case stage: ShuffleQueryStageExec =>
+        stage.getRuntimeStatistics.sizeInBytes
       case _ => return None
     }
     val rightSize = right match {
-      case plan @ AQEShuffleReadExec(stage: ShuffleQueryStageExec, _) =>
-        stage.mapStats.get.bytesByPartitionId.sum
+      case stage: ShuffleQueryStageExec =>
+        stage.getRuntimeStatistics.sizeInBytes
       case _ => return None
     }
     if (rightSize <= leftSize) {
@@ -80,7 +80,7 @@ object RewriteJoin extends JoinSelectionHelper {
   }
 
   def rewrite(plan: SparkPlan): SparkPlan = plan match {
-    case shj: CometHashJoinExec =>
+    case stage: ShuffleQueryStageExec =>
       getOptimalBuildSide(shj.left, shj.right) match {
         case Some(buildSide) => shj.copy(buildSide = buildSide)
         case _ => plan
