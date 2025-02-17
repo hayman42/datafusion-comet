@@ -80,7 +80,7 @@ object RewriteJoin extends JoinSelectionHelper {
   }
 
   def rewrite(plan: SparkPlan): SparkPlan = plan match {
-    case stage: ShuffleQueryStageExec =>
+    case shj: CometHashJoinExec =>
       getOptimalBuildSide(shj.left, shj.right) match {
         case Some(buildSide) => shj.copy(buildSide = buildSide)
         case _ => plan
